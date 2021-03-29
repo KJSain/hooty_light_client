@@ -3,89 +3,100 @@
 #
 # Author: A homunculus
 
-from winreg import *
-from datetime import datetime, timedelta
-from dateutil import tz
-import time
-import urllib.request
-import json
-import sys
-
-CONST_TIMEZONE = 'America/Edmonton'
+from PySide6.QtWidgets import (QLineEdit, QPushButton, QApplication, QVBoxLayout,
+                               QPlainTextEdit, QMainWindow, QWidget)
+from PySide6.QtCore import (QThreadPool, Slot)
+from os import path
+import sys, configparser
+import runner
 
 
-# Convert Microsoft's screwy registry values into something usable
-def return_posix_time(registry_time_val):
-    last_used_sec = int(hex(registry_time_val), 16) / 10
-    last_used_date = datetime(1601, 1, 1) + timedelta(microseconds=last_used_sec)
-    last_used_date = last_used_date.replace(tzinfo=tz.gettz('UTC'))
-    return last_used_date.astimezone(tz.gettz(CONST_TIMEZONE))
+# Our main window for the hooty client!
+class MainWindow(QMainWindow):
+
+    def __init__(self):
+        super().__init__()
+
+        self.setWindowTitle("Hooty Light Client")
+        self.program_started = False
+        self.log_text_box = QPlainTextEdit(self)
+        self.log_text_box.setReadOnly(True)
+        self.url = self.get_url_config()
+        self.edit_url = QLineEdit(self.url)
+        self.run_button = QPushButton("Run Hooty!")
+
+        widgy = QWidget()
+        layout = QVBoxLayout()
+        widgy.setLayout(layout)
+        layout.addWidget(self.log_text_box)
+        layout.addWidget(self.edit_url)
+        layout.addWidget(self.run_button)
+        self.setLayout(layout)
+        self.setCentralWidget(widgy)
+        self.thread_pool = QThreadPool()
+
+        # Create a runner
+        self.runner = runner.JobRunner(self.edit_url.text())
+        self.thread_pool.start(self.runner)
+
+        self.runner.logHandler.log.signal.connect(self.write_log)
+
+        # Run some actions when we press the hooty button!
+        self.run_button.pressed.connect(lambda: self.runner.set_url(self.edit_url.text()))
+        self.run_button.pressed.connect(lambda: self.write_url_config(self.edit_url.text()))
+        self.run_button.pressed.connect(self.runner.clicked)
+        self.run_button.pressed.connect(self.hooty_button_text)
+
+        self.show()
+
+    # Get the url from the config file if it is there
+    def get_url_config(self):
+        config = configparser.ConfigParser()
+        if path.exists("hooty.ini"):
+            try:
+                config.read("hooty.ini")
+                return config['DEFAULT']['url']
+            except:
+                return "url.example"
+        else:
+            return "url.example"
+
+    # Write your url to the file!
+    # TODO: Maybe I should only write if the url is a valid working one..
+    def write_url_config(self, url):
+        config = configparser.ConfigParser()
+        config['DEFAULT'] = {'url': url}
+        with open('hooty.ini', 'w') as configfile:
+            config.write(configfile)
+
+    # Change some text!
+    # TODO: Something something variables
+    def hooty_button_text(self):
+        if self.run_button.text() == "Run Hooty!":
+            self.run_button.setText("Hooty is running!")
+        else:
+            self.run_button.setText("Run Hooty!")
+
+    # First time we run our actual worker thread
+    # No reason to run it immediately
+    def run_thread(self):
+        # Thread runner
+        if self.program_started is False:
+            self.thread_pool.start(self.runner)
+
+    # Make sure we actually kill the worker
+    def closeEvent(self, event):
+        self.runner.exit()
+
+    # writing to our log & scroll to the bottom
+    @Slot(str)
+    def write_log(self, log_text):
+        self.log_text_box.appendPlainText(log_text)
+        self.log_text_box.centerCursor()
 
 
-# Helper function - mic - hkey
-def get_microphone_time_stamp():
-    hkey_string = r'SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\microphone\NonPackaged'
-
-    return get_time_stamp(hkey_string)
-
-
-# Helper function - webcam hkey
-def get_webcam_time_stamp():
-    hkey_string = r'SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\webcam\NonPackaged'
-    return get_time_stamp(hkey_string)
-
-
-def get_time_stamp(hkey_string):
-    registry = ConnectRegistry(None, HKEY_CURRENT_USER)
-    base_hkey = OpenKey(registry, hkey_string)
-    app_time_stamps = {}
-    # iterate through the available applications to see if their start time is later than the stored end time
-    for i in range(99999):
-        try:
-            sub_hkey_str = EnumKey(base_hkey, i)
-            sub_hkey = OpenKey(registry, hkey_string + "\\" + sub_hkey_str)
-            last_time_start = return_posix_time(QueryValueEx(sub_hkey, 'LastUsedTimeStart')[0])
-            last_time_stop = return_posix_time(QueryValueEx(sub_hkey, 'LastUsedTimeStop')[0])
-            app_name = sub_hkey_str.split('#')[-1]
-            app_time_stamps[app_name] = {'last_time_start': last_time_start, 'last_time_stop': last_time_stop}
-        except EnvironmentError:
-            break
-    return app_time_stamps
-
-
-# Helper function for maths
-def get_min_sec(difference):
-    return divmod(difference.days * 86400 + difference.seconds, 60)
-
-
-# Get call status, if in a call return the app name as well
-def determine_call_status(app_time_stamps):
-    current_time = datetime.now().replace(tzinfo=tz.gettz(CONST_TIMEZONE))
-
-    for app in app_time_stamps:
-        diff_start = get_min_sec(current_time - app_time_stamps[app]['last_time_start'])
-        diff_stop = get_min_sec(current_time - app_time_stamps[app]['last_time_stop'])
-        diff_app = get_min_sec(app_time_stamps[app]['last_time_stop'] - app_time_stamps[app]['last_time_start'])
-        if diff_app[0] < 0:
-            return app, True
-    return None, False
-
-# JSon request sender
-def json_request(myurl, json_body):
-    req = urllib.request.Request(myurl)
-    req.add_header('Content-Type', 'application/json; charset=utf-8')
-    jsondata = json.dumps(json_body)
-    jsondataasbytes = jsondata.encode('utf-8')  # needs to be bytes
-    req.add_header('Content-Length', len(jsondataasbytes))
-    response = urllib.request.urlopen(req, jsondataasbytes)
-
-
+# Main program
 if __name__ == '__main__':
-    while True:
-        # Boring loop
-        mic_state = determine_call_status(get_microphone_time_stamp())
-        vid_state = determine_call_status(get_webcam_time_stamp())
-
-        json_request(str(sys.argv[1]), {'mic_state': mic_state[1],
-                                        'vid_state': vid_state[1]})
-        time.sleep(5)
+    app = QApplication([])
+    w = MainWindow()
+    sys.exit(app.exec_())
